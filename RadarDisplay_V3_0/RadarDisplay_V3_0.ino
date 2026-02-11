@@ -74,6 +74,10 @@ void setup() {
   }
 
   drawRadarBackground();
+
+//test line - comment out if running live
+//  generateTestData(); // <--- ADD THIS LINE HERE
+
   startWiFi();
 }
 
@@ -303,12 +307,27 @@ void fetchStock(String symbol, int idx) {
   HTTPClient http;
   String url = "https://finnhub.io/api/v1/quote?symbol=" + symbol + "&token=" + String(finnhubapi);
   http.begin(url);
-  if (http.GET() == HTTP_CODE_OK) {
+  
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
     DynamicJsonDocument doc(512);
     deserializeJson(doc, http.getString());
-    stockPrices[idx] = doc["c"];
+    
+    float newPrice = doc["c"];
+    stockPrices[idx] = newPrice;
     stockChanges[idx] = doc["d"];
     stockPercents[idx] = doc["dp"];
+
+    // --- NEW LOGIC: Save to History ---
+    // 1. Shift everything to the left
+    for (int j = 0; j < SPARK_POINTS - 1; j++) {
+      history[idx][j] = history[idx][j+1];
+    }
+    // 2. Add new price to the end
+    history[idx][SPARK_POINTS - 1] = newPrice;
+    
+  } else {
+    if(DEBUG_SERIAL) Serial.printf("Stock HTTP Error: %d\n", httpCode);
   }
   http.end();
 }
@@ -458,7 +477,7 @@ void updateClock() {
     tft.drawString(timeStr, 4, 10); 
     
     tft.setFreeFont(&FreeSans9pt7b); 
-    tft.setTextColor(0x7BEF, TFT_BLACK); 
+    tft.setTextColor(0xF81F, TFT_BLACK); 
     char dateStr[22];
     strftime(dateStr, sizeof(dateStr), "%b %d, %Y", &timeinfo);
     tft.drawString(dateStr, 12, 50); 
@@ -480,29 +499,64 @@ void drawSparkline(int x, int y, int w, int h, uint16_t color) {
     hasData = true;
   }
 
+  // If no valid data or flat line, skip drawing
   if (!hasData || maxP == minP) return;
 
-  // 2. Draw "Day Break" Indicator (Grey Vertical Line)
-  // This helps visualize where the market closed yesterday vs today
-  int breakPoint = SPARK_POINTS / 2; // Midpoint indicator for visual separation
-  int breakX = x + (breakPoint * w / (SPARK_POINTS - 1));
-  tft.drawFastVLine(breakX, y - h, h, 0x4208); // Dark Grey divider
+  // --- NEW LOGIC: Dynamic Market Open Line ---
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    // Check if it's a weekday (1=Mon ... 5=Fri)
+    if (timeinfo.tm_wday >= 1 && timeinfo.tm_wday <= 5) {
+      
+      // Calculate minutes since midnight for NOW
+      int currentMinutes = (timeinfo.tm_hour * 60) + timeinfo.tm_min;
+      
+      // Market Open Target: 8:30 AM = 510 minutes
+      int openMinutes = (8 * 60) + 30; 
 
-  // 3. Draw the Sparkline
+      // Calculate minutes per graph point based on fetchInterval
+      // e.g., 900000ms / 60000 = 15 minutes per point
+      int minutesPerPoint = fetchInterval / 60000;
+      if (minutesPerPoint < 1) minutesPerPoint = 1; // Safety check
+
+      // Calculate how many "slots" ago the market opened
+      int minutesSinceOpen = currentMinutes - openMinutes;
+      int indicesSinceOpen = minutesSinceOpen / minutesPerPoint;
+
+      // The far RIGHT of the graph (SPARK_POINTS - 1) is "Now"
+      // Subtract indicesSinceOpen to find the "Open" position
+      int openIndex = (SPARK_POINTS - 1) - indicesSinceOpen;
+
+      // Only draw if the line falls within the visible graph (0 to 29)
+      if (openIndex >= 0 && openIndex < SPARK_POINTS) {
+        int breakX = x + (openIndex * w / (SPARK_POINTS - 1));
+        tft.drawFastVLine(breakX, y - h, h, 0x4208); // Dark Grey divider
+      }
+    }
+  }
+  // -------------------------------------------
+
+  // 2. Draw the Sparkline
   for (int i = 0; i < SPARK_POINTS - 1; i++) {
+    // Skip if either point is invalid (0)
     if (history[currentStockIdx][i] <= 0 || history[currentStockIdx][i + 1] <= 0) continue;
 
-    // Map points to the box dimensions
+    // Map X coordinates
     int x1 = x + (i * w / (SPARK_POINTS - 1));
     int x2 = x + ((i + 1) * w / (SPARK_POINTS - 1));
 
-    // Inverse Y mapping (higher price = lower pixel Y)
-    int y1 = y - (int)((history[currentStockIdx][i] - minP) / (maxP - minP) * h);
-    int y2 = y - (int)((history[currentStockIdx][i + 1] - minP) / (maxP - minP) * h);
+    // Map Y coordinates (Inverted: Higher price = Lower pixel Y)
+    // Added safety for divide-by-zero if maxP == minP (handled above, but good practice)
+    int range = (maxP - minP);
+    if (range == 0) range = 1; 
+
+    int y1 = y - (int)((history[currentStockIdx][i] - minP) / range * h);
+    int y2 = y - (int)((history[currentStockIdx][i + 1] - minP) / range * h);
 
     tft.drawLine(x1, y1, x2, y2, color);
   }
 }
+
 void drawSystemHealth() {
   int yPos = 310;
   tft.drawFastHLine(0, yPos - 3, 480, 0x4208);
@@ -564,5 +618,19 @@ void drawCylonScanner() {
     tft.fillRect(cylonPos + 7, yPos + 1, 11, 8, TFT_RED);
     cylonPos += cylonDir;
     if (cylonPos <= minX || cylonPos >= maxX) cylonDir *= -1;
+  }
+}
+//test set for troubleshooting
+void generateTestData() {
+  for (int i = 0; i < NUM_STOCKS; i++) {
+    for (int j = 0; j < SPARK_POINTS; j++) {
+      // Generate a float between 150.00 and 160.00
+      float randomCent = (float)random(0, 1000) / 100.0; 
+      history[i][j] = 150.0 + randomCent;
+    }
+    // Also set the current price to match the last point so the text matches the line
+    stockPrices[i] = history[i][SPARK_POINTS - 1];
+    stockChanges[i] = 1.50; // Fake positive change
+    stockPercents[i] = 1.0; // Fake 1% up
   }
 }
