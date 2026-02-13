@@ -44,9 +44,11 @@ int lastDisplayedSQ = -1;
 
 // Timing
 unsigned long lastDataFetch = 0;
-const unsigned long fetchInterval = 900000; // 15 mins
 unsigned long lastStockRotate = 0;
 
+
+bool wifiConnectedCached = false;
+unsigned long lastConnectionCheck = 0;
 unsigned long lastCylonUpdate = 0;
 int cylonPos = 160;
 int cylonDir = 4;
@@ -81,23 +83,24 @@ void setup() {
   startWiFi();
 }
 
+
 // --- MAIN LOOP ---
 void loop() {
-// 1. TOUCH HANDLING (WiFi Label Toggle - Bottom Left)
+  // 1. TOUCH HANDLING (Keep your existing logic)
   uint16_t t_x = 0, t_y = 0;
   if (tft.getTouch(&t_x, &t_y)) {
-    // Target: Bottom Left corner where "WiFi: [SSID]" is drawn
-    // X < 120 (covers the label) and Y > 300 (bottom status bar)
     if (t_x > 360 && t_y < 50) {
       useSecondaryWiFi = !useSecondaryWiFi;
       timeIsSet = false;
-      lastDataFetch = 0;  // Force immediate re-fetch
+      lastDataFetch = 0;  
       tft.fillScreen(TFT_BLACK);
       drawRadarBackground();
       startWiFi();
-      delay(1000); // Debounce to prevent rapid toggling
+      delay(1000); 
     }
   }
+
+  // 2. RADAR (Keep your existing logic)
   while (Serial1.available() >= 22) {
     if (Serial1.read() == 0xAA) {
       if (Serial1.read() == 0xFF && Serial1.read() == 0x03 && Serial1.read() == 0x00) {
@@ -109,26 +112,57 @@ void loop() {
   }
 
   updateClock();
-  
+
+  // --- CACHE WIFI STATUS (Run once every 1000ms) ---
+  if (millis() - lastConnectionCheck > 1000) {
+    wifiConnectedCached = (WiFi.status() == WL_CONNECTED);
+    lastConnectionCheck = millis();
+    
+    // OPTIONAL: If we just reconnected, force a Time Sync check here
+    if (wifiConnectedCached && !timeIsSet) {
+       configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+       timeIsSet = true;
+    }
+  }
+
   if (millis() - lastCylonUpdate > 30) {
     drawCylonScanner();
     lastCylonUpdate = millis();
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!timeIsSet) {
-      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-      timeIsSet = true;
-      drawSystemHealth();
-    }
-    if (millis() - lastDataFetch > fetchInterval || lastDataFetch == 0) {
-      fetchAllData();
-      lastDataFetch = millis();
-      drawInfoPanel();
-      drawWorldDashboard();
-    }
+  // --- OPTIMIZED WI-FI HANDLING ---
+  
+  // A. Time Sync: Only check status every 2 seconds if time is missing
+  // (Prevents hammering when time isn't set)
+  static unsigned long lastTimeCheck = 0;
+  if (!timeIsSet && (millis() - lastTimeCheck > 2000)) {
+     if (WiFi.status() == WL_CONNECTED) {
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        timeIsSet = true;
+        drawSystemHealth();
+     }
+     lastTimeCheck = millis();
   }
 
+  // B. Data Fetch: Only check status when the 15-minute timer is UP
+  // (This stops the constant pinging during the 14 minutes and 59 seconds of idle time)
+  if (millis() - lastDataFetch > fetchInterval || lastDataFetch == 0) {
+     
+     // NOW we check the status
+     if (WiFi.status() == WL_CONNECTED) {
+        fetchAllData();
+        lastDataFetch = millis();
+        drawInfoPanel();
+        drawWorldDashboard();
+     } else {
+        // If we needed data but WiFi was down, wait 1 minute before checking again
+        // (Instead of hammering or waiting the full 15 mins)
+        if (DEBUG_SERIAL) Serial.println("WiFi Down - Retrying in 1 min");
+        lastDataFetch = millis() - (fetchInterval - 60000); 
+     }
+  }
+
+  // 3. STOCK ROTATION
   if (millis() - lastStockRotate > rotateInterval) {
     currentStockIdx = (currentStockIdx + 1) % NUM_STOCKS;
     drawInfoPanel();
@@ -193,17 +227,17 @@ void processRadarData(uint8_t* data) {
 
 void drawRadarBackground() {
   int minX = 159, maxX = 479, maxY = 160;
-  uint16_t circleColor = 0x0140; // Dark Green
-  uint16_t gridColor = 0x0560;   // Tactical Green
+  uint16_t circleColor = 0x0560; // Dark Green
+  uint16_t gridColor = 0x0140;   // Tactical Green
   
   // 1. DYNAMIC RINGS
   // Inner Ring (1/2 Range)
   // Logic: ( (MAX_RANGE / 2) / MAX_RANGE ) * 160px = 80px
-  tft.drawCircle(319, 0, 80, circleColor); 
+  tft.drawCircle(319, 0, 80-1, circleColor); 
   
   // Outer Ring (Full Range)
   // Logic: ( MAX_RANGE / MAX_RANGE ) * 160px = 160px
-  tft.drawCircle(319, 0, 160, circleColor);
+  tft.drawCircle(319, 0, 160-1, circleColor);
 
   // 2. GRID LINES
   for (int x = minX; x <= maxX; x += 80) tft.drawLine(x, 0, x, maxY, gridColor);
@@ -612,7 +646,9 @@ void drawTacticalHUD(int16_t rawX, int16_t rawY, bool hasTarget) {
 
 void drawCylonScanner() {
   int yPos = 310, minX = 160, maxX = 320 - 25;
-  if (WiFi.status() != WL_CONNECTED) {
+  
+  // Use the cached variable instead of WiFi.status()
+  if (!wifiConnectedCached) { 
     tft.fillRect(minX, yPos, (maxX - minX) + 25, 10, TFT_BLACK);
     tft.fillRect(cylonPos, yPos + 2, 25, 6, 0x8000);
     tft.fillRect(cylonPos + 7, yPos + 1, 11, 8, TFT_RED);
@@ -620,6 +656,7 @@ void drawCylonScanner() {
     if (cylonPos <= minX || cylonPos >= maxX) cylonDir *= -1;
   }
 }
+
 //test set for troubleshooting
 void generateTestData() {
   for (int i = 0; i < NUM_STOCKS; i++) {

@@ -55,5 +55,6 @@ const int NUM_STOCKS = sizeof(stockSymbols) / sizeof(stockSymbols[0]);
 
 // Rotation interval (10000 = 10 seconds)
 const unsigned long rotateInterval = 10000;
+const unsigned long fetchInterval = 900000;  // 15 mins
 
 #endif
