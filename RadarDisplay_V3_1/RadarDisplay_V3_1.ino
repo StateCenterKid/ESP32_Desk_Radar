@@ -2,6 +2,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <SPI.h>
+#include <SD.h>
+#include <FS.h>
 #include "time.h"
 #include "config.h"
 
@@ -15,6 +18,8 @@ extern "C" {
 #endif
 
 TFT_eSPI tft = TFT_eSPI();
+//sd card chip select
+#define SD_CS 5 
 
 // --- CONFIGURATION ---
 const int16_t MAX_RANGE = 8000;
@@ -80,6 +85,7 @@ void setup() {
   }
 
   drawRadarBackground();
+  loadHistoryFromSD();
 
   //test line - comment out if running live
   //generateTestData(); // <--- ADD THIS LINE HERE
@@ -148,22 +154,14 @@ void loop() {
     lastTimeCheck = millis();
   }
 
-  // B. Data Fetch: Only check status when the 15-minute timer is UP
-  // (This stops the constant pinging during the 14 minutes and 59 seconds of idle time)
+// B. Data Fetch: Timer fires unconditionally every 5 mins!
   if (millis() - lastDataFetch > fetchInterval || lastDataFetch == 0) {
-
-    // NOW we check the status
-    if (WiFi.status() == WL_CONNECTED) {
-      fetchAllData();
-      lastDataFetch = millis();
-      drawInfoPanel();
-      drawWorldDashboard();
-    } else {
-      // If we needed data but WiFi was down, wait 1 minute before checking again
-      // (Instead of hammering or waiting the full 15 mins)
-      if (DEBUG_SERIAL) Serial.println("WiFi Down - Retrying in 1 min");
-      lastDataFetch = millis() - (fetchInterval - 60000);
-    }
+    
+    fetchAllData(); // <--- Run this NO MATTER WHAT
+    lastDataFetch = millis();
+    
+    drawInfoPanel();
+    drawWorldDashboard();
   }
 
   // 3. STOCK ROTATION
@@ -174,6 +172,51 @@ void loop() {
     lastStockRotate = millis();
   }
 }
+
+// --- SD CARD FUNCTIONS ---
+void loadHistoryFromSD() {
+  if (!SD.begin(SD_CS)) {
+    if (DEBUG_SERIAL) Serial.println("SD Mount Failed or Card Missing");
+    return;
+  }
+  
+  if (SD.exists("/history.bin")) {
+    File file = SD.open("/history.bin", FILE_READ);
+    if (file) {
+      
+      // --- THE NEW SAFETY CHECK ---
+      // Does the file size exactly match our current memory bucket?
+      if (file.size() == sizeof(history)) {
+        file.read((uint8_t*)history, sizeof(history));
+        if (DEBUG_SERIAL) Serial.println("Stock history loaded safely!");
+      } else {
+        // The bucket size changed! (Fetch rate or Num Stocks was altered)
+        if (DEBUG_SERIAL) Serial.println("Settings changed! Deleting obsolete history file.");
+        file.close();
+        SD.remove("/history.bin"); // Delete the incompatible file
+        return; // Exit without loading garbage data
+      }
+      // ----------------------------
+      
+      file.close();
+    }
+  } else {
+    if (DEBUG_SERIAL) Serial.println("No history file found (First boot).");
+  }
+}
+
+void saveHistoryToSD() {
+  // Overwrite the old file with the new array
+  File file = SD.open("/history.bin", FILE_WRITE);
+  if (file) {
+    file.write((const uint8_t*)history, sizeof(history));
+    file.close();
+    if (DEBUG_SERIAL) Serial.println("History saved to SD.");
+  } else {
+    if (DEBUG_SERIAL) Serial.println("Failed to write to SD.");
+  }
+}
+
 // Helper function to split text into two lines without cutting words in half
 void splitWeatherText(String fullText, String& line1, String& line2, int maxChars) {
   line1 = "";
@@ -295,19 +338,43 @@ void startWiFi() {
   WiFi.begin(activeSSID, activePASS);
 }
 
+// Helper function to check if the market is actively trading
+bool isMarketOpen() {
+  struct tm timeinfo;
+  // If we don't have time yet, default to true so we don't accidentally miss data
+  if (!getLocalTime(&timeinfo)) return true; 
+
+  // Weekend Check: Sunday (0) or Saturday (6)
+  if (timeinfo.tm_wday == 0 || timeinfo.tm_wday == 6) return false;
+
+  int currentMins = (timeinfo.tm_hour * 60) + timeinfo.tm_min;
+  int closeMins = MARKET_OPEN_MINS + TRADING_MINUTES;
+
+  // Are we between 8:30 AM and 3:00 PM Central?
+  if (currentMins >= MARKET_OPEN_MINS && currentMins < closeMins) {
+    return true;
+  }
+  return false;
+}
+
 void fetchAllData() {
-  // 1. Local Weather
-  fetchWeather();
-  delay(1000);  // 1 second gap
+  // 1 & 2. Weather 
+  if (WiFi.status() == WL_CONNECTED) {
+    fetchWeather();
+    delay(1000);
+    fetchWorldWeather();
+    delay(500);
+  }
 
-  // 2. Global Weather
-  fetchWorldWeather();
-  delay(500);
-
-  // 3. Stocks (Finnhub is generally more lenient than OWM)
+  // 3. Stocks 
   for (int i = 0; i < NUM_STOCKS; i++) {
     fetchStock(stockSymbols[i], i);
-    delay(200);
+    delay(200); 
+  }
+  
+  // 4. Save to SD (ONLY if the market is open and data actually changed!)
+  if (isMarketOpen()) {
+    saveHistoryToSD();
   }
 }
 
@@ -379,35 +446,51 @@ void fetchWeather() {
 }
 
 void fetchStock(String symbol, int idx) {
-  HTTPClient http;
-  String url = "https://finnhub.io/api/v1/quote?symbol=" + symbol + "&token=" + String(finnhubapi);
-  http.begin(url);
-  http.setTimeout(8000); // Give Finnhub 8 seconds to reply before hanging up
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_OK) {
-    DynamicJsonDocument doc(512);
-    deserializeJson(doc, http.getString());
+  bool marketOpen = isMarketOpen();
 
-    float newPrice = doc["c"];
-    stockPrices[idx] = newPrice;
-    stockChanges[idx] = doc["d"];
-    stockPercents[idx] = doc["dp"];
+  // --- 1. PROCESS THE LIVE DATA ---
+  // We always fetch so the text (Price, % Change) stays accurate after hours
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "https://finnhub.io/api/v1/quote?symbol=" + symbol + "&token=" + String(finnhubapi);
+    http.begin(url);
+    http.setTimeout(8000);
+    int httpCode = http.GET();
 
-    // --- NEW LOGIC: Save to History ---
-    // 1. Shift everything to the left
-    for (int j = 0; j < SPARK_POINTS - 1; j++) {
-      history[idx][j] = history[idx][j + 1];
+    if (httpCode == HTTP_CODE_OK) {
+      DynamicJsonDocument doc(512);
+      deserializeJson(doc, http.getString());
+      
+      float newPrice = doc["c"];
+      stockPrices[idx] = newPrice;
+      stockChanges[idx] = doc["d"];
+      stockPercents[idx] = doc["dp"];
+
+      // --- 2. RECORD HISTORY (ONLY IF MARKET IS OPEN) ---
+      if (marketOpen) {
+        for (int j = 0; j < SPARK_POINTS - 1; j++) {
+          history[idx][j] = history[idx][j + 1];
+        }
+        history[idx][SPARK_POINTS - 1] = newPrice;
+      }
+
+    } else {
+      if (DEBUG_SERIAL) Serial.printf("Stock HTTP Error: %d\n", httpCode);
+      // If fetch fails but market is open, hold the line
+      if (marketOpen) {
+        for (int j = 0; j < SPARK_POINTS - 1; j++) history[idx][j] = history[idx][j + 1];
+        history[idx][SPARK_POINTS - 1] = history[idx][SPARK_POINTS - 2];
+      }
     }
-    // 2. Add new price to the end
-    history[idx][SPARK_POINTS - 1] = newPrice;
-
+    http.end();
   } else {
-    if (DEBUG_SERIAL) Serial.printf("Stock HTTP Error: %d\n", httpCode);
+    // NO WIFI
+    if (marketOpen) {
+      for (int j = 0; j < SPARK_POINTS - 1; j++) history[idx][j] = history[idx][j + 1];
+      history[idx][SPARK_POINTS - 1] = history[idx][SPARK_POINTS - 2];
+    }
   }
-  http.end();
 }
-
-
 
 // --- UI DRAWING ---
 void drawWorldDashboard() {
@@ -602,32 +685,28 @@ void drawSparkline(int x, int y, int w, int h, uint16_t color) {
   // If no valid data or flat line, skip drawing
   if (!hasData || maxP == minP) return;
 
-  // --- NEW LOGIC: Dynamic Market Open Line ---
+// --- NEW LOGIC: Dynamic Market Open Line ---
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
-    // Check if it's a weekday (1=Mon ... 5=Fri)
     if (timeinfo.tm_wday >= 1 && timeinfo.tm_wday <= 5) {
-
-      // Calculate minutes since midnight for NOW
+      
       int currentMinutes = (timeinfo.tm_hour * 60) + timeinfo.tm_min;
+      int closeMins = MARKET_OPEN_MINS + TRADING_MINUTES;
 
-      // Calculate minutes per graph point based on fetchInterval
-      // e.g., 900000ms / 60000 = 15 minutes per point
-      int minutesPerPoint = fetchInterval / 60000;
-      if (minutesPerPoint < 1) minutesPerPoint = 1;  // Safety check
+      // ONLY draw the sliding line if the market is actively open
+      if (currentMinutes >= MARKET_OPEN_MINS && currentMinutes < closeMins) {
+        
+        int minutesPerPoint = fetchInterval / 60000;
+        if (minutesPerPoint < 1) minutesPerPoint = 1; 
 
-      // Calculate how many "slots" ago the market opened
-      int minutesSinceOpen = currentMinutes - MARKET_OPEN_MINS;
-      int indicesSinceOpen = minutesSinceOpen / minutesPerPoint;
+        int minutesSinceOpen = currentMinutes - MARKET_OPEN_MINS;
+        int indicesSinceOpen = minutesSinceOpen / minutesPerPoint;
+        int openIndex = (SPARK_POINTS - 1) - indicesSinceOpen;
 
-      // The far RIGHT of the graph (SPARK_POINTS - 1) is "Now"
-      // Subtract indicesSinceOpen to find the "Open" position
-      int openIndex = (SPARK_POINTS - 1) - indicesSinceOpen;
-
-      // Only draw if the line falls within the visible graph (0 to 29)
-      if (openIndex >= 0 && openIndex < SPARK_POINTS) {
-        int breakX = x + (openIndex * w / (SPARK_POINTS - 1));
-        tft.drawFastVLine(breakX, y - h, h, 0x4208);  // Dark Grey divider
+        if (openIndex >= 0 && openIndex < SPARK_POINTS) {
+          int breakX = x + (openIndex * w / (SPARK_POINTS - 1));
+          tft.drawFastVLine(breakX, y - h, h, 0x4208); 
+        }
       }
     }
   }
