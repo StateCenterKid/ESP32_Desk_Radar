@@ -24,7 +24,7 @@ TFT_eSPI tft = TFT_eSPI();
 // --- CONFIGURATION ---
 const int16_t MAX_RANGE = 8000;
 const int16_t MIN_RANGE = 100;
-const int16_t MIN_QUAL = 2;
+const int16_t MIN_QUAL = 10;
 const int16_t EMPTY = 9999;
 const bool PLOT_SERIAL = true;
 const bool DEBUG_SERIAL = true;
@@ -50,7 +50,7 @@ int lastDisplayedSQ = -1;
 // Timing
 unsigned long lastDataFetch = 0;
 unsigned long lastStockRotate = 0;
-
+unsigned long lastSDWriteTime = 0; // Tracks the last successful SD save
 
 bool wifiConnectedCached = false;
 unsigned long lastConnectionCheck = 0;
@@ -211,6 +211,7 @@ void saveHistoryToSD() {
   if (file) {
     file.write((const uint8_t*)history, sizeof(history));
     file.close();
+    lastSDWriteTime = millis(); 
     if (DEBUG_SERIAL) Serial.println("History saved to SD.");
   } else {
     if (DEBUG_SERIAL) Serial.println("Failed to write to SD.");
@@ -562,11 +563,14 @@ void drawWorldDashboard() {
     tft.setTextColor(0xF7BE, TFT_BLACK);  // Dimmer grey/blue
 
     // We nudge the X position by 42 pixels to sit right after the "00F" text
+    tft.fillRect(xBase+50, startY+73, 42, 17, TFT_BLACK);
     tft.setCursor(xBase + 52, startY + 75);
-    tft.printf("%.0fC ", celsius);
+    tft.printf("%.0fC", celsius);
+  
 
     // Conditions
     tft.setTextSize(1);
+    tft.fillRect(xBase - 4, startY + 90, 100, 25, TFT_BLACK);
     tft.setTextColor(0xF7BE, TFT_BLACK);
     tft.setCursor(xBase-4, startY + 90);
     String d = worldCities[i].desc;
@@ -696,11 +700,9 @@ void drawSparkline(int x, int y, int w, int h, uint16_t color) {
       // ONLY draw the sliding line if the market is actively open
       if (currentMinutes >= MARKET_OPEN_MINS && currentMinutes < closeMins) {
         
-        int minutesPerPoint = fetchInterval / 60000;
-        if (minutesPerPoint < 1) minutesPerPoint = 1; 
-
         int minutesSinceOpen = currentMinutes - MARKET_OPEN_MINS;
-        int indicesSinceOpen = minutesSinceOpen / minutesPerPoint;
+        // Multiply first to preserve the fraction, then divide!
+        int indicesSinceOpen = (minutesSinceOpen * 60000) / fetchInterval;
         int openIndex = (SPARK_POINTS - 1) - indicesSinceOpen;
 
         if (openIndex >= 0 && openIndex < SPARK_POINTS) {
@@ -734,28 +736,32 @@ void drawSparkline(int x, int y, int w, int h, uint16_t color) {
 
 void drawSystemHealth() {
   int yPos = 310;
+  
   tft.drawFastHLine(0, yPos - 3, 480, 0x4208);
   tft.fillRect(0, yPos, 480, 10, TFT_BLACK);
+  
   tft.setTextSize(1);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  
   tft.setCursor(5, yPos);
-  tft.print("WiFi:");
-  tft.print(WiFi.SSID());
-  tft.setCursor(125, yPos);
+  tft.printf("WiFi: %.12s", WiFi.SSID().c_str());
+  
+  tft.setCursor(120, yPos);
   tft.print("RSSI:");
   tft.print(WiFi.RSSI());
-  tft.setCursor(245, yPos);
-  tft.print("SQ:");
   updateSQDisplay();
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  updateSDStatusDisplay();
   float chipTemp = (temprature_sens_read() - 32) / 1.8;
   tft.setCursor(400, yPos);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   tft.print("Core:");
   tft.printf("%.1fC", chipTemp);
 }
 
 void updateSQDisplay() {
-  int xPos = 245, yPos = 310;
+  int xPos = 220, yPos = 310;
+  tft.setCursor(xPos, yPos);
+  tft.print("SQ:");
   tft.fillRect(xPos + 18, yPos, 30, 10, TFT_BLACK);
   if (currentSignal > 45) tft.setTextColor(TFT_GREEN, TFT_BLACK);
   else if (currentSignal >= MIN_QUAL) tft.setTextColor(TFT_YELLOW, TFT_BLACK);
@@ -763,6 +769,29 @@ void updateSQDisplay() {
   tft.setCursor(xPos + 18, yPos);
   tft.print(currentSignal);
   tft.print("%");
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+}
+
+void updateSDStatusDisplay() {
+  int xPos = 310, yPos = 310;
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK); 
+  tft.setCursor(xPos, yPos); 
+  
+  if (!isMarketOpen()) {
+    // Market is closed, SD is safely locked
+    tft.print("SD: ");
+    tft.setTextColor(TFT_RED, TFT_BLACK); 
+    tft.print("CLOSED  "); 
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  } else if (lastSDWriteTime == 0) {
+    // Market is open, but waiting for the first 5-minute cycle to finish
+    tft.print("SD:---Wait---"); 
+  } else {
+    // Market is open and actively saving
+    int minsAgo = (millis() - lastSDWriteTime) / 60000;
+    tft.printf("SD: %2dm ago", minsAgo); 
+  }
 }
 
 void drawTacticalHUD(int16_t rawX, int16_t rawY, bool hasTarget) {
@@ -816,4 +845,4 @@ void generateTestData() {
     stockChanges[i] = 1.50;  // Fake positive change
     stockPercents[i] = 1.0;  // Fake 1% up
   }
-} 
+  }
