@@ -1,5 +1,7 @@
 # --- PROJECT SPECIFIC ---
 config.h 
+build/
+/RadarDisplay_V3_1/build
 
 # Prerequisites
 *.d
@@ -42,3 +44,15 @@ config.h
 
 # debug information files
 *.dwo
+# --- ESP32 & ARDUINO SPECIFIC ---
+# Catch raw firmware files exported to the root directory
+*.bin
+*.elf
+*.hex
+*.map
+
+# --- OS GENERATED TRASH ---
+# Mac hidden folder settings
+.DS_Store
+# Windows thumbnail caches
+Thumbs.db
