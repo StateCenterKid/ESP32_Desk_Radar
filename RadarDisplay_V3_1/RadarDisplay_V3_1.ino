@@ -19,7 +19,7 @@ extern "C" {
 
 TFT_eSPI tft = TFT_eSPI();
 //sd card chip select
-#define SD_CS 5 
+#define SD_CS 5
 
 // --- CONFIGURATION ---
 const int16_t MAX_RANGE = 8000;
@@ -28,6 +28,7 @@ const int16_t MIN_QUAL = 10;
 const int16_t EMPTY = 9999;
 const bool PLOT_SERIAL = true;
 const bool DEBUG_SERIAL = true;
+
 
 struct Person {
   int16_t xHistory[10];
@@ -39,7 +40,7 @@ uint16_t targetColors[3] = { TFT_CYAN, TFT_MAGENTA, TFT_YELLOW };
 float stockPrices[NUM_STOCKS], stockChanges[NUM_STOCKS], stockPercents[NUM_STOCKS];
 float currentTemp = 0;
 int currentHumid = 0;
-String weatherCond = "---";
+String weatherCond = "----wait----";
 int currentStockIdx = 0;
 
 // Signal Smoothing
@@ -48,9 +49,8 @@ int currentSignal = 0;
 int lastDisplayedSQ = -1;
 
 // Timing
-unsigned long lastDataFetch = 0;
 unsigned long lastStockRotate = 0;
-unsigned long lastSDWriteTime = 0; // Tracks the last successful SD save
+unsigned long lastSDWriteTime = 0;  // Tracks the last successful SD save
 
 bool wifiConnectedCached = false;
 unsigned long lastConnectionCheck = 0;
@@ -59,30 +59,40 @@ int cylonPos = 160;
 int cylonDir = 4;
 bool timeIsSet = false;
 bool wasConnected = false;
+bool owmHealthy = false;
+bool finnhubHealthy = false;
+
+// THE MASTER TIMERS
+unsigned long lastFetchAttempt = 0;
+unsigned long lastHistoryUpdate = 0;
 
 // --- NETWORK FAILOVER ---
 bool useSecondaryWiFi = false;
-unsigned long currentNetworkAttemptStart = 0; // Tracks time since connection loss
-const int16_t MAX_TIMEOUT = 30000; // WiFi Timeout before refresh
+unsigned long currentNetworkAttemptStart = 0;  // Tracks time since connection loss
+const int16_t MAX_TIMEOUT = 30000;             // WiFi Timeout before refresh
 
 // --- MARKET SETTINGS ---
-const int TRADING_MINUTES = 390; 
+const int TRADING_MINUTES = 390;
 // Local time the market opens, in minutes since midnight (8:30 AM Central)
 const int MARKET_OPEN_MINS = 510;
 const int SPARK_POINTS = (TRADING_MINUTES * 60000) / fetchInterval;
 float history[NUM_STOCKS][SPARK_POINTS];
 
+
 // --- SETUP ---
 void setup() {
   if (DEBUG_SERIAL) Serial.begin(115200);
-  
+
   // 1. RADAR FIX: Set to 256000 baud and add a 10ms anti-freeze timeout
   Serial1.begin(256000, SERIAL_8N1, 25, 32);
-  Serial1.setTimeout(10); 
+  Serial1.setTimeout(10);
 
-  // 2. BUTTON & SPI FIX: Pin 0 is our button, Pin 5 is our SD Card (Chip Select)
+  // 2. BUTTON & SPI FIX: Pin 0 is our button, Pin 5 is our SD Card
   pinMode(0, INPUT_PULLUP);
-  pinMode(5, OUTPUT); 
+  pinMode(5, OUTPUT);
+
+  // FORCE SD CARD TO MUTE BEFORE SCREEN INIT
+  digitalWrite(5, HIGH);
 
   tft.init();
   tft.setRotation(1);
@@ -104,11 +114,28 @@ void setup() {
 
 // --- MAIN LOOP ---
 void loop() {
-  // 1. SPI TRAFFIC CONTROL 
-  // Force the SD Card (Pin 5) to stop talking to prevent bus conflicts
-  digitalWrite(5, HIGH); 
+  unsigned long currentMillis = millis();
 
-  // 2. RADAR & CLOCK UPDATES
+  // --- 1. THE STRICT HISTORY LOGGING ---
+  // Fires perfectly on time, completely independent of Wi-Fi status
+  if (currentMillis - lastHistoryUpdate >= fetchInterval) {
+    lastHistoryUpdate = currentMillis;
+    updateSparklineHistory();
+  }
+
+  // --- 2. THE FLEXIBLE WI-FI FETCHING ---
+  bool timeForNormalUpdate = (currentMillis - lastFetchAttempt >= fetchInterval);
+  bool timeForRetry = ((WiFi.status() != WL_CONNECTED) && (currentMillis - lastFetchAttempt >= 60000));
+
+  // Wait to fetch until after boot (when lastFetchAttempt is 0 and wifi connects)
+  if (timeForNormalUpdate || timeForRetry || (lastFetchAttempt == 0 && WiFi.status() == WL_CONNECTED)) {
+    lastFetchAttempt = currentMillis;
+    fetchAllData();
+    drawInfoPanel();
+    drawWorldDashboard();
+  }
+
+  // 3. RADAR & CLOCK UPDATES
   while (Serial1.available() >= 22) {
     if (Serial1.read() == 0xAA && Serial1.read() == 0xFF && Serial1.read() == 0x03 && Serial1.read() == 0x00) {
       uint8_t payload[18];
@@ -118,26 +145,17 @@ void loop() {
   }
   updateClock();
 
-  // 3. AUTO-FALLBACK WIFI WATCHDOG & TIME SYNC
+  // 4. AUTO-FALLBACK WIFI WATCHDOG & TIME SYNC
   if (WiFi.status() != WL_CONNECTED) {
-    // If 60 seconds have passed without a successful connection...
     if (millis() - currentNetworkAttemptStart > MAX_TIMEOUT) {
       if (DEBUG_SERIAL) Serial.println("Connection timeout. Switching networks...");
-      
-      useSecondaryWiFi = !useSecondaryWiFi; // Flip to the other network
-      
-      // Reset flags to force a fresh data pull once connected
+      useSecondaryWiFi = !useSecondaryWiFi;
       timeIsSet = false;
-      lastDataFetch = 0; 
-      
-      startWiFi(); // This will use the new network and restart the 60s stopwatch
+      lastFetchAttempt = 0;  // Force immediate fetch upon connection
+      startWiFi();
     }
   } else {
-    // We are successfully connected!
-    // Keep the stopwatch synced to the current time so it only counts up when disconnected
-    currentNetworkAttemptStart = millis(); 
-    
-    // 4. TIME BLINDNESS FIX
+    currentNetworkAttemptStart = millis();
     if (!timeIsSet) {
       configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
       timeIsSet = true;
@@ -145,22 +163,14 @@ void loop() {
     }
   }
 
-  // 5. DATA FETCH TIMER (Unconditional 5-minute cycle)
-    if (millis() - lastDataFetch > fetchInterval || (lastDataFetch == 0 && WiFi.status() == WL_CONNECTED)) {
-    fetchAllData();
-    lastDataFetch = millis();
-    drawInfoPanel();
-    drawWorldDashboard();
-  }
-
-  // 6. STOCK ROTATION
+  // 5. STOCK ROTATION
   if (millis() - lastStockRotate > rotateInterval) {
     currentStockIdx = (currentStockIdx + 1) % NUM_STOCKS;
     drawInfoPanel();
     drawSystemHealth();
     lastStockRotate = millis();
   }
-} 
+}
 
 // --- SD CARD FUNCTIONS ---
 void loadHistoryFromSD() {
@@ -168,25 +178,19 @@ void loadHistoryFromSD() {
     if (DEBUG_SERIAL) Serial.println("SD Mount Failed or Card Missing");
     return;
   }
-  
+
   if (SD.exists("/history.bin")) {
     File file = SD.open("/history.bin", FILE_READ);
     if (file) {
-      
-      // --- THE NEW SAFETY CHECK ---
-      // Does the file size exactly match our current memory bucket?
       if (file.size() == sizeof(history)) {
         file.read((uint8_t*)history, sizeof(history));
         if (DEBUG_SERIAL) Serial.println("Stock history loaded safely!");
       } else {
-        // The bucket size changed! (Fetch rate or Num Stocks was altered)
         if (DEBUG_SERIAL) Serial.println("Settings changed! Deleting obsolete history file.");
         file.close();
-        SD.remove("/history.bin"); // Delete the incompatible file
-        return; // Exit without loading garbage data
+        SD.remove("/history.bin");
+        return;
       }
-      // ----------------------------
-      
       file.close();
     }
   } else {
@@ -195,49 +199,63 @@ void loadHistoryFromSD() {
 }
 
 void saveHistoryToSD() {
-  // Overwrite the old file with the new array
   File file = SD.open("/history.bin", FILE_WRITE);
   if (file) {
     file.write((const uint8_t*)history, sizeof(history));
     file.close();
-    lastSDWriteTime = millis(); 
+    lastSDWriteTime = millis();
     if (DEBUG_SERIAL) Serial.println("History saved to SD.");
   } else {
     if (DEBUG_SERIAL) Serial.println("Failed to write to SD.");
   }
 }
 
+// --- NEW STRICT HISTORY UPDATER ---
+void updateSparklineHistory() {
+  // 1. Only do this if the market is actually open
+  if (!isMarketOpen()) return;
+
+  // 2. Shift the history array over by one slot for ALL stocks
+  for (int i = 0; i < NUM_STOCKS; i++) {
+    for (int j = 0; j < SPARK_POINTS - 1; j++) {
+      history[i][j] = history[i][j + 1];
+    }
+    // 3. Drop the most recently known price into the final slot.
+    // If Wi-Fi works, this is a new price. If Wi-Fi is down, it drops in the old price.
+    history[i][SPARK_POINTS - 1] = stockPrices[i];
+  }
+
+  // 4. Save the newly shifted bucket to the SD card
+  saveHistoryToSD();
+
+  // 5. Force the SD card to hang up the SPI bus to protect the TFT screen
+  digitalWrite(5, HIGH);
+}
+
+
 // Helper function to split text into two lines without cutting words in half
 void splitWeatherText(String fullText, String& line1, String& line2, int maxChars) {
   line1 = "";
   line2 = "";
 
-  // If it already fits on one line, we are done
   if (fullText.length() <= maxChars) {
     line1 = fullText;
     return;
   }
 
-  // Look for the last space character within our max limit
   int splitIndex = -1;
   for (int i = 0; i <= maxChars; i++) {
-    if (fullText.charAt(i) == ' ') {
-      splitIndex = i;
-    }
+    if (fullText.charAt(i) == ' ') splitIndex = i;
   }
 
   if (splitIndex > 0) {
-    // We found a space! Split it there.
     line1 = fullText.substring(0, splitIndex);
-    line2 = fullText.substring(splitIndex + 1);  // Skip the space itself
+    line2 = fullText.substring(splitIndex + 1);
   } else {
-    // No space found (e.g., the word "Thunderstorms" is 13 letters)
-    // We have to force a hard cut
     line1 = fullText.substring(0, maxChars);
     line2 = fullText.substring(maxChars);
   }
 
-  // Safety trim: If line 2 is still too long, chop off the excess
   if (line2.length() > maxChars) {
     line2 = line2.substring(0, maxChars);
   }
@@ -298,22 +316,18 @@ void processRadarData(uint8_t* data) {
 
 void drawRadarBackground() {
   int minX = 159, maxX = 479, maxY = 160;
-  uint16_t circleColor = 0x0560;  // Dark Green
-  uint16_t gridColor = 0x05E0; // Tactical Green
+  uint16_t circleColor = 0x0560;
+  uint16_t gridColor = 0x05E0;
 
-  // 1. DYNAMIC RINGS
-  // Inner Ring (1/2 Range)
-  // Logic: ( (MAX_RANGE / 2) / MAX_RANGE ) * 160px = 80px
   tft.drawCircle(319, 0, 80 - 1, circleColor);
-  // Outer Ring (Full Range)
-  // Logic: ( MAX_RANGE / MAX_RANGE ) * 160px = 160px
   tft.drawCircle(319, 0, 160 - 1, circleColor);
-  // 2. GRID LINES
+
   for (int x = minX; x <= maxX; x += 80) tft.drawLine(x, 0, x, maxY, gridColor);
   for (int y = 0; y <= maxY; y += 80) tft.drawLine(minX, y, maxX, y, gridColor);
-  // 3. ORIGIN POINT
-  tft.fillCircle(319, 0, 5, 0x8000);  // Maroon/Red center
+
+  tft.fillCircle(319, 0, 5, 0x8000);
 }
+
 
 // --- DATA FETCHING ---
 void startWiFi() {
@@ -321,25 +335,19 @@ void startWiFi() {
   const char* activeSSID = useSecondaryWiFi ? ssid2 : ssid;
   const char* activePASS = useSecondaryWiFi ? password2 : password;
   WiFi.begin(activeSSID, activePASS);
-  
-  // Reset the stopwatch for the new connection attempt
+
   currentNetworkAttemptStart = millis();
-  if (currentNetworkAttemptStart == 0) currentNetworkAttemptStart = 1; 
+  if (currentNetworkAttemptStart == 0) currentNetworkAttemptStart = 1;
 }
 
-// Helper function to check if the market is actively trading
 bool isMarketOpen() {
   struct tm timeinfo;
-  // assume the market is CLOSED on boot to protect the SD card from $0.00 blind writes.
-  if (!getLocalTime(&timeinfo)) return false; 
-  
-  // Weekend Check: Sunday (0) or Saturday (6)
+  if (!getLocalTime(&timeinfo)) return false;
   if (timeinfo.tm_wday == 0 || timeinfo.tm_wday == 6) return false;
-  
+
   int currentMins = (timeinfo.tm_hour * 60) + timeinfo.tm_min;
   int closeMins = MARKET_OPEN_MINS + TRADING_MINUTES;
-  
-  // Are we between 8:30 AM and 3:00 PM Central?
+
   if (currentMins >= MARKET_OPEN_MINS && currentMins < closeMins) {
     return true;
   }
@@ -347,7 +355,6 @@ bool isMarketOpen() {
 }
 
 void fetchAllData() {
-  // 1 & 2. Weather 
   if (WiFi.status() == WL_CONNECTED) {
     fetchWeather();
     delay(1000);
@@ -355,26 +362,22 @@ void fetchAllData() {
     delay(500);
   }
 
-  // 3. Stocks 
   for (int i = 0; i < NUM_STOCKS; i++) {
     fetchStock(stockSymbols[i], i);
-    delay(200); 
+    delay(200);
   }
-  
-  // 4. Save to SD (ONLY if the market is open and data actually changed!)
-  if (isMarketOpen()) {
-    saveHistoryToSD();
-  }
+  // Notice SD saving is completely removed from here!
 }
 
 void fetchWorldWeather() {
   HTTPClient http;
   for (int i = 0; i < 3; i++) {
     String url = "http://api.openweathermap.org/data/2.5/weather?lat=" + String(worldCities[i].lat) + "&lon=" + String(worldCities[i].lon) + "&units=imperial&appid=" + String(OWM_API_KEY);
-    http.setTimeout(5000);  // 5 second timeout for slow connections
+    http.setTimeout(5000);
     http.begin(url);
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
+      owmHealthy = true;
       DynamicJsonDocument doc(1024);
       deserializeJson(doc, http.getString());
       worldCities[i].temp = doc["main"]["temp"];
@@ -382,313 +385,261 @@ void fetchWorldWeather() {
       if (worldCities[i].desc.length() > 0) {
         worldCities[i].desc.setCharAt(0, toupper(worldCities[i].desc.charAt(0)));
       }
-    } else if (DEBUG_SERIAL) {
-      Serial.printf("OWM Error (%s): %d\n", worldCities[i].name, httpCode);
-    }
-    http.end();
-    delay(500);  // Increased delay to 0.5 seconds between global pings
-  }
-}
-
-void fetchWeather() {
-  HTTPClient http;
-  // Cleaned up URL construction
-  // Format: q=City,State,Country
-  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(weatherCity) + "," + String(weatherState) + "," + String(weatherCountry) + "&units=imperial&appid=" + String(OWM_API_KEY);
-  if (DEBUG_SERIAL) {
-    Serial.print("Local Weather URL: ");
-    Serial.println(url);
-  }
-
-  http.setTimeout(5000);
-  http.begin(url);
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, payload);
-    if (!error) {
-      currentTemp = doc["main"]["temp"];
-      currentHumid = doc["main"]["humidity"];
-      weatherCond = doc["weather"][0]["description"].as<String>();
-      if (weatherCond.length() > 0) {
-        weatherCond.setCharAt(0, toupper(weatherCond.charAt(0)));
-      }
-
-      if (DEBUG_SERIAL) Serial.printf("Local Weather: %.1fF, %s\n", currentTemp, weatherCond.c_str());
     } else {
-      if (DEBUG_SERIAL) Serial.println("Local Weather JSON Parse Failed");
-    }
-  } else {
-    if (DEBUG_SERIAL) {
-      Serial.print("Local Weather HTTP Error: ");
-      Serial.println(httpCode);
+      owmHealthy = false;
+      if (DEBUG_SERIAL) {
+        Serial.print("Local Weather HTTP Error: ");
+        Serial.println(httpCode);
+      }
+      http.end();
+      delay(500);
     }
   }
-  http.end();
-}
+  }
 
-void fetchStock(String symbol, int idx) {
-  bool marketOpen = isMarketOpen();
-  // --- 1. PROCESS THE LIVE DATA ---
-  // We always fetch so the text (Price, % Change) stays accurate after hours
-  if (WiFi.status() == WL_CONNECTED) {
+  void fetchWeather() {
     HTTPClient http;
-    String url = "https://finnhub.io/api/v1/quote?symbol=" + symbol + "&token=" + String(finnhubapi);
+    String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(weatherCity) + "," + String(weatherState) + "," + String(weatherCountry) + "&units=imperial&appid=" + String(OWM_API_KEY);
+    if (DEBUG_SERIAL) {
+      Serial.print("Local Weather URL: ");
+      Serial.println(url);
+    }
+
+    http.setTimeout(5000);
     http.begin(url);
-    http.setTimeout(8000);
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
-      DynamicJsonDocument doc(512);
-      deserializeJson(doc, http.getString());
-      
-      float newPrice = doc["c"];
-      stockPrices[idx] = newPrice;
-      stockChanges[idx] = doc["d"];
-      stockPercents[idx] = doc["dp"];
-
-      // --- 2. RECORD HISTORY (ONLY IF MARKET IS OPEN) ---
-      if (marketOpen) {
-        for (int j = 0; j < SPARK_POINTS - 1; j++) {
-          history[idx][j] = history[idx][j + 1];
+      String payload = http.getString();
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        currentTemp = doc["main"]["temp"];
+        currentHumid = doc["main"]["humidity"];
+        weatherCond = doc["weather"][0]["description"].as<String>();
+        if (weatherCond.length() > 0) {
+          weatherCond.setCharAt(0, toupper(weatherCond.charAt(0)));
         }
-        history[idx][SPARK_POINTS - 1] = newPrice;
+      } else {
+        if (DEBUG_SERIAL) Serial.println("Local Weather JSON Parse Failed");
       }
-
     } else {
-      if (DEBUG_SERIAL) Serial.printf("Stock HTTP Error: %d\n", httpCode);
-      // If fetch fails but market is open, hold the line
-      if (marketOpen) {
-        for (int j = 0; j < SPARK_POINTS - 1; j++) history[idx][j] = history[idx][j + 1];
-        history[idx][SPARK_POINTS - 1] = history[idx][SPARK_POINTS - 2];
+      if (DEBUG_SERIAL) {
+        Serial.print("Local Weather HTTP Error: ");
+        Serial.println(httpCode);
       }
     }
     http.end();
-  } else {
-    // NO WIFI
-    if (marketOpen) {
-      for (int j = 0; j < SPARK_POINTS - 1; j++) history[idx][j] = history[idx][j + 1];
-      history[idx][SPARK_POINTS - 1] = history[idx][SPARK_POINTS - 2];
+  }
+
+  void fetchStock(String symbol, int idx) {
+    // NO MORE ARRAY MATH IN HERE! Just fetch the data.
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = "https://finnhub.io/api/v1/quote?symbol=" + symbol + "&token=" + String(finnhubapi);
+      http.begin(url);
+      http.setTimeout(8000);
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        finnhubHealthy = true;
+        DynamicJsonDocument doc(512);
+        deserializeJson(doc, http.getString());
+
+        stockPrices[idx] = doc["c"];
+        stockChanges[idx] = doc["d"];
+        stockPercents[idx] = doc["dp"];
+
+      } else {
+        finnhubHealthy = false;
+        if (DEBUG_SERIAL) Serial.printf("Stock HTTP Error: %d\n", httpCode);
+      }
+      http.end();
     }
   }
-}
 
-// --- UI DRAWING ---
-void drawWorldDashboard() {
-  int startX = 160;
-  int startY = 180;
-  int endY = 300;
-  int gridW = 319;
-  int colWidth = 106;
-  int paddingX = 10;
-  // 1. DRAW BOX & GRID
-  uint16_t borderColor = TFT_ORANGE;
-  tft.drawRoundRect(startX, startY, gridW, endY - startY, 8, borderColor);
-  tft.drawLine(266, startY, 266, endY, borderColor);
-  tft.drawLine(372, startY, 372, endY, borderColor);
-  tft.drawFastHLine(startX, startY + 30, gridW, borderColor);
-  // 2. TIME MATH
-  time_t now;
-  time(&now);  // 'now' is ALWAYS UTC in the Unix world
+  // --- UI DRAWING ---
+  void drawWorldDashboard() {
+    int startX = 160;
+    int startY = 180;
+    int endY = 300;
+    int gridW = 319;
+    int colWidth = 106;
+    int paddingX = 10;
 
-  // We need local info only to see if the LOCAL system thinks we are in DST
-  struct tm* loc;
-  loc = localtime(&now);
+    uint16_t borderColor = TFT_ORANGE;
+    tft.drawRoundRect(startX, startY, gridW, endY - startY, 8, borderColor);
+    tft.drawLine(266, startY, 266, endY, borderColor);
+    tft.drawLine(372, startY, 372, endY, borderColor);
+    tft.drawFastHLine(startX, startY + 30, gridW, borderColor);
 
-  for (int i = 0; i < 3; i++) {
-    int xBase = 160 + (i * colWidth) + paddingX;
-    // Unix 'now' is UTC. We simply add the city offset.
-    time_t cityTime = now + worldCities[i].gmtOffset;
-    // Handle DST for the target city
-    // If we are currently in DST in Missouri, we assume Cluj (hasDST=true)
-    // is also in its Summer Time (+1 hour).
-    if (worldCities[i].hasDST && loc->tm_isdst > 0) {
-      cityTime += 3600;
-    }
+    time_t now;
+    time(&now);
+    struct tm* loc;
+    loc = localtime(&now);
 
-    // gmtime converts the calculated timestamp into a readable struct without
-    // applying any local ESP32 timezone settings.
-    struct tm* info = gmtime(&cityTime);
-    char timeBuf[12];
-    strftime(timeBuf, sizeof(timeBuf), "%I:%M%p", info);
+    for (int i = 0; i < 3; i++) {
+      int xBase = 160 + (i * colWidth) + paddingX;
+      time_t cityTime = now + worldCities[i].gmtOffset;
 
-    // 3. DRAWING
-    tft.setFreeFont(NULL);
-    tft.setTextSize(2);
-    // Header: Display Name (e.g., "  Cluj")
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    tft.setCursor(xBase, startY + 8);
-    tft.print(worldCities[i].displayName);
-    // Corrected Time
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setCursor(xBase, startY + 42);
-    tft.print(timeBuf);
-    // --- Temperature Row ---
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(xBase, startY + 68);
-    tft.printf("%.0fF", worldCities[i].temp);
-    // --- NEW: Celsius Equivalent ---
-    // Calculate C, set to Size 1, and dim the color
-    float celsius = (worldCities[i].temp - 32) * 5.0 / 9.0;
-    tft.setTextSize(1);
-    tft.setTextColor(0xF7BE, TFT_BLACK);  // Dimmer grey/blue
+      if (worldCities[i].hasDST && loc->tm_isdst > 0) {
+        cityTime += 3600;
+      }
 
-    // We nudge the X position by 42 pixels to sit right after the "00F" text
-    tft.fillRect(xBase+50, startY+73, 42, 17, TFT_BLACK);
-    tft.setCursor(xBase + 52, startY + 75);
-    tft.printf("%.0fC", celsius);
-  
+      struct tm* info = gmtime(&cityTime);
+      char timeBuf[12];
+      strftime(timeBuf, sizeof(timeBuf), "%I:%M%p", info);
 
-    // Conditions
-    tft.setTextSize(1);
-    tft.fillRect(xBase - 4, startY + 90, 100, 25, TFT_BLACK);
-    tft.setTextColor(0xF7BE, TFT_BLACK);
-    tft.setCursor(xBase-4, startY + 90);
-    String d = worldCities[i].desc;
-    String wLine1, wLine2;
-    splitWeatherText(d, wLine1, wLine2, 16);
-    tft.print(wLine1);
-    // Draw Line 2 (only if there is text to draw)
-    if (wLine2.length() > 0) {
-      tft.setCursor(xBase-4, startY + 90 + 10);
-      tft.print(wLine2);
-    }
-  }
-}
+      tft.setFreeFont(NULL);
+      tft.setTextSize(2);
 
-void drawInfoPanel() {
-  // 1. Clear Weather Area (Y=65 to Y=165)
-  tft.fillRect(0, 65, 150, 100, TFT_BLACK);
-  // --- LOCAL CITY NAME ---
-  tft.setTextSize(1);
-  tft.setFreeFont(NULL);  // Ensure system font for consistency
-  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-  tft.setCursor(10, 78);
-  tft.print(localDisplayName);
+      tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+      tft.setCursor(xBase, startY + 8);
+      tft.print(worldCities[i].displayName);
 
-  // --- WEATHER DATA (Shifted down) ---
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(2);
-  // Temperature & Humidity (Moved from 85 to 90)
-  tft.setCursor(10, 98);
-  tft.printf("%.0fF, H:%d%%", currentTemp, currentHumid);
-  // Weather Condition (Moved from 105 to 115)
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setCursor(xBase, startY + 42);
+      tft.print(timeBuf);
 
-  String wLine1, wLine2;
-  splitWeatherText(weatherCond, wLine1, wLine2, 12);
-  // Draw Line 1
-  tft.setCursor(10, 123);
-  tft.print(wLine1);
-  // Draw Line 2 (only if there is text to draw)
-  if (wLine2.length() > 0) {
-    // Add pixel offset based on your font size (e.g., +15 pixels down)
-    tft.setCursor(10, 123 + 17);
-    tft.print(wLine2);
-  }
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(xBase - 6, startY + 68);
+      tft.printf("%.0fF", worldCities[i].temp);
 
-  // 2. Draw Stocks (Remains at Y=175)
-  int stockY = 175;
-  tft.fillRect(0, stockY, 150, 132, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setCursor(10, stockY);
-  tft.print(stockSymbols[currentStockIdx]);
+      float celsius = (worldCities[i].temp - 32) * 5.0 / 9.0;
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
+      tft.fillRect(xBase + 48, startY + 67, 46, 17, TFT_BLACK);
+      tft.setCursor(xBase + 48, startY + 68);
+      tft.printf("%.0fc", celsius);
 
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, stockY + 20);
-  tft.printf("$%.2f", stockPrices[currentStockIdx]);
-  uint16_t trend = (stockChanges[currentStockIdx] >= 0) ? TFT_GREEN : TFT_RED;
-  tft.setTextColor(trend, TFT_BLACK);
-  tft.setCursor(10, stockY + 40);
-  tft.printf("%+.2f%%", stockPercents[currentStockIdx]);
-  // Redraw Sparkline (right, bottom, width, height, trend)
-  drawSparkline(5, 295, 130, 60, trend);
-}
-
-void updateClock() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return;
-  static int lastMin = -1;
-  if (timeinfo.tm_min != lastMin) {
-    lastMin = timeinfo.tm_min;
-
-    tft.fillRect(0, 0, 150, 65, TFT_BLACK);
-    // Using internal GFX Font pointers (usually enabled by default in TFT_eSPI)
-    tft.setFreeFont(&FreeSansBold18pt7b);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    char timeStr[12];
-    strftime(timeStr, sizeof(timeStr), "%I:%M %p", &timeinfo);
-    tft.drawString(timeStr, 4, 10);
-
-    tft.setFreeFont(&FreeSans9pt7b);
-    tft.setTextColor(0xF81F, TFT_BLACK);
-    char dateStr[22];
-    strftime(dateStr, sizeof(dateStr), "%b %d, %Y", &timeinfo);
-    tft.drawString(dateStr, 12, 50);
-
-    tft.setFreeFont(NULL);  // Always reset to standard font
-    drawWorldDashboard();
-  }
-}
-
-void drawSparkline(int x, int y, int w, int h, uint16_t color) {
-  float minP = 999999, maxP = 0;
-  bool hasData = false;
-
-  // 1. Find Min/Max for Scaling
-  for (int i = 0; i < SPARK_POINTS; i++) {
-    if (history[currentStockIdx][i] <= 0) continue;
-    minP = min(minP, history[currentStockIdx][i]);
-    maxP = max(maxP, history[currentStockIdx][i]);
-    hasData = true;
-  }
-
-  // If no valid data or flat line, skip drawing
-  if (!hasData || maxP == minP) return;
-  // --- NEW LOGIC: Dynamic Market Open Line ---
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    if (timeinfo.tm_wday >= 1 && timeinfo.tm_wday <= 5) {
-      
-      int currentMinutes = (timeinfo.tm_hour * 60) + timeinfo.tm_min;
-      int closeMins = MARKET_OPEN_MINS + TRADING_MINUTES;
-
-      // ONLY draw the sliding line if the market is actively open
-      if (currentMinutes >= MARKET_OPEN_MINS && currentMinutes < closeMins) {
-        
-        int minutesSinceOpen = currentMinutes - MARKET_OPEN_MINS;
-        // Multiply first to preserve the fraction, then divide!
-        int indicesSinceOpen = (minutesSinceOpen * 60000) / fetchInterval;
-        int openIndex = (SPARK_POINTS - 1) - indicesSinceOpen;
-
-        if (openIndex >= 0 && openIndex < SPARK_POINTS) {
-          int breakX = x + (openIndex * w / (SPARK_POINTS - 1));
-          tft.drawFastVLine(breakX, y - h, h, 0x4208); 
-        }
+      tft.setTextSize(1);
+      tft.fillRect(xBase - 4, startY + 90, 100, 25, TFT_BLACK);
+      tft.setTextColor(0xF7BE, TFT_BLACK);
+      tft.setCursor(xBase - 4, startY + 90);
+      String d = worldCities[i].desc;
+      String wLine1, wLine2;
+      splitWeatherText(d, wLine1, wLine2, 16);
+      tft.print(wLine1);
+      if (wLine2.length() > 0) {
+        tft.setCursor(xBase - 4, startY + 90 + 10);
+        tft.print(wLine2);
       }
     }
   }
-  // -------------------------------------------
 
-  // 2. Draw the Sparkline
-  for (int i = 0; i < SPARK_POINTS - 1; i++) {
-    // Skip if either point is invalid (0)
-    if (history[currentStockIdx][i] <= 0 || history[currentStockIdx][i + 1] <= 0) continue;
-    // Map X coordinates
-    int x1 = x + (i * w / (SPARK_POINTS - 1));
-    int x2 = x + ((i + 1) * w / (SPARK_POINTS - 1));
-    // Map Y coordinates (using floats to preserve decimals!)
-    float range = (maxP - minP);
-    if (range <= 0.001) range = 1.0;  // Safe check for floats
+  void drawInfoPanel() {
+    tft.fillRect(0, 65, 155, 100, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setFreeFont(NULL);
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setCursor(10, 78);
+    tft.print(localDisplayName);
 
-    int y1 = y - (int)((history[currentStockIdx][i] - minP) / range * h);
-    int y2 = y - (int)((history[currentStockIdx][i + 1] - minP) / range * h);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(10, 98);
+    tft.printf("%.0fF, H:%d%%", currentTemp, currentHumid);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
 
-    tft.drawLine(x1, y1, x2, y2, color);
+    String wLine1, wLine2;
+    splitWeatherText(weatherCond, wLine1, wLine2, 12);
+    tft.setCursor(10, 123);
+    tft.print(wLine1);
+    if (wLine2.length() > 0) {
+      tft.setCursor(10, 123 + 17);
+      tft.print(wLine2);
+    }
+
+    int stockY = 175;
+    tft.fillRect(0, stockY, 158, 132, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setCursor(10, stockY);
+    tft.print(stockSymbols[currentStockIdx]);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(10, stockY + 20);
+    tft.printf("$%.2f", stockPrices[currentStockIdx]);
+    uint16_t trend = (stockChanges[currentStockIdx] >= 0) ? TFT_GREEN : TFT_RED;
+    tft.setTextColor(trend, TFT_BLACK);
+    tft.setCursor(10, stockY + 40);
+    tft.printf("%+.2f%%", stockPercents[currentStockIdx]);
+
+    drawSparkline(5, 295, 140, 60, trend);
   }
-}
+
+  void updateClock() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return;
+    static int lastMin = -1;
+    if (timeinfo.tm_min != lastMin) {
+      lastMin = timeinfo.tm_min;
+
+      tft.fillRect(0, 0, 155, 65, TFT_BLACK);
+      tft.setFreeFont(&FreeSansBold18pt7b);
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      char timeStr[12];
+      strftime(timeStr, sizeof(timeStr), "%I:%M %p", &timeinfo);
+      tft.drawString(timeStr, 4, 10);
+
+      tft.setFreeFont(&FreeSans9pt7b);
+      tft.setTextColor(0xF81F, TFT_BLACK);
+      char dateStr[22];
+      strftime(dateStr, sizeof(dateStr), "%b %d, %Y", &timeinfo);
+      tft.drawString(dateStr, 12, 50);
+
+      tft.setFreeFont(NULL);
+      drawWorldDashboard();
+    }
+  }
+
+  void drawSparkline(int x, int y, int w, int h, uint16_t color) {
+    float minP = 999999, maxP = 0;
+    bool hasData = false;
+
+    for (int i = 0; i < SPARK_POINTS; i++) {
+      if (history[currentStockIdx][i] <= 0) continue;
+      minP = min(minP, history[currentStockIdx][i]);
+      maxP = max(maxP, history[currentStockIdx][i]);
+      hasData = true;
+    }
+
+    if (!hasData || maxP == minP) return;
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      if (timeinfo.tm_wday >= 1 && timeinfo.tm_wday <= 5) {
+
+        int currentMinutes = (timeinfo.tm_hour * 60) + timeinfo.tm_min;
+        int closeMins = MARKET_OPEN_MINS + TRADING_MINUTES;
+
+        if (currentMinutes >= MARKET_OPEN_MINS && currentMinutes < closeMins) {
+
+          int minutesSinceOpen = currentMinutes - MARKET_OPEN_MINS;
+          int indicesSinceOpen = (minutesSinceOpen * 60000) / fetchInterval;
+          int openIndex = (SPARK_POINTS - 1) - indicesSinceOpen;
+
+          if (openIndex >= 0 && openIndex < SPARK_POINTS) {
+            int breakX = x + (openIndex * w / (SPARK_POINTS - 1));
+            tft.drawFastVLine(breakX, y - h, h, TFT_WHITE);
+          }
+        }
+      }
+    }
+
+    for (int i = 0; i < SPARK_POINTS - 1; i++) {
+      if (history[currentStockIdx][i] <= 0 || history[currentStockIdx][i + 1] <= 0) continue;
+      int x1 = x + (i * w / (SPARK_POINTS - 1));
+      int x2 = x + ((i + 1) * w / (SPARK_POINTS - 1));
+
+      float range = (maxP - minP);
+      if (range <= 0.001) range = 1.0;
+
+      int y1 = y - (int)((history[currentStockIdx][i] - minP) / range * h);
+      int y2 = y - (int)((history[currentStockIdx][i + 1] - minP) / range * h);
+
+      tft.drawLine(x1, y1, x2, y2, color);
+    }
+  }
 
 void drawSystemHealth() {
   int yPos = 310;
@@ -702,101 +653,89 @@ void drawSystemHealth() {
   tft.setCursor(5, yPos);
   tft.printf("WiFi: %.12s", WiFi.SSID().c_str());
   
-  tft.setCursor(120, yPos);
-  tft.print("RSSI:");
-  tft.print(WiFi.RSSI());
+  // --- CONNECTION INDICATOR DOTS (Replacing RSSI) ---
+  int dotX = 135; 
+  int dotY = yPos + 3; // Vertically aligned with text
+  int radius = 3;
+  int spacing = 12;
+
+  uint16_t wifiColor = (WiFi.status() == WL_CONNECTED) ? TFT_GREEN : TFT_RED;
+  uint16_t owmColor = owmHealthy ? TFT_GREEN : TFT_RED;
+  uint16_t finColor = finnhubHealthy ? TFT_GREEN : TFT_RED;
+
+  tft.fillCircle(dotX, dotY, radius, wifiColor);               // 1. WiFi
+  tft.fillCircle(dotX + spacing, dotY, radius, owmColor);      // 2. OpenWeather
+  tft.fillCircle(dotX + (spacing * 2), dotY, radius, finColor);// 3. Finnhub
+  // --------------------------------------------------
+  
   updateSQDisplay();
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   updateSDStatusDisplay();
+  
   float chipTemp = (temprature_sens_read() - 32) / 1.8;
   tft.setCursor(400, yPos);
   tft.print("Core:");
   tft.printf("%.1fC", chipTemp);
 }
 
-void updateSQDisplay() {
-  int xPos = 220, yPos = 310;
-  tft.setCursor(xPos, yPos);
-  tft.print("SQ:");
-  tft.fillRect(xPos + 18, yPos, 30, 10, TFT_BLACK);
-  if (currentSignal > 45) tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  else if (currentSignal >= MIN_QUAL) tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  else tft.setTextColor(TFT_RED, TFT_BLACK);
-  tft.setCursor(xPos + 18, yPos);
-  tft.print(currentSignal);
-  tft.print("%");
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-}
-
-void updateSDStatusDisplay() {
-  int xPos = 310, yPos = 310;
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK); 
-  tft.setCursor(xPos, yPos);
-  if (!isMarketOpen()) {
-    // Market is closed, SD is safely locked
-    tft.print("SD: ");
-    tft.setTextColor(TFT_RED, TFT_BLACK); 
-    tft.print("CLOSED  "); 
+  void updateSQDisplay() {
+    int xPos = 220, yPos = 310;
+    tft.setCursor(xPos, yPos);
+    tft.print("SQ:");
+    tft.fillRect(xPos + 18, yPos, 30, 10, TFT_BLACK);
+    if (currentSignal > 45) tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    else if (currentSignal >= MIN_QUAL) tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    else tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(xPos + 18, yPos);
+    tft.print(currentSignal);
+    tft.print("%");
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  } else if (lastSDWriteTime == 0) {
-    // Market is open, but waiting for the first 5-minute cycle to finish
-    tft.print("SD:---Wait---");
-  } else {
-    // Market is open and actively saving
-    int minsAgo = (millis() - lastSDWriteTime) / 60000;
-    tft.printf("SD: %2dm ago", minsAgo); 
   }
-}
 
-void drawTacticalHUD(int16_t rawX, int16_t rawY, bool hasTarget) {
-  // Positioning for the Top-Right Corner of the grid
-  const int hudX = 425;
-  const int hudY = 10;
-
-  if (hasTarget) {
-    // Clear the small area for the two lines of text
-    tft.fillRect(hudX - 5, hudY - 2, 55, 30, TFT_BLACK);
+  void updateSDStatusDisplay() {
+    int xPos = 310, yPos = 310;
     tft.setTextSize(1);
-    tft.setTextColor(0x05E0, TFT_BLACK);  // Tactical Green
-
-    // Line 1: X Coordinate
-    tft.setCursor(hudX, hudY);
-    tft.printf("X: %d", rawX);
-
-    // Line 2: Y Coordinate
-    tft.setCursor(hudX, hudY + 15);
-    tft.printf("Y: %d", rawY);
-  } else {
-    // If no target, clear the corner
-    tft.fillRect(hudX - 5, hudY - 2, 55, 30, TFT_BLACK);
-  }
-}
-
-void drawCylonScanner() {
-  int yPos = 310, minX = 160, maxX = 320 - 25;
-  // Use the cached variable instead of WiFi.status()
-  if (!wifiConnectedCached) {
-    tft.fillRect(minX, yPos, (maxX - minX) + 25, 10, TFT_BLACK);
-    tft.fillRect(cylonPos, yPos + 2, 25, 6, 0x8000);
-    tft.fillRect(cylonPos + 7, yPos + 1, 11, 8, TFT_RED);
-    cylonPos += cylonDir;
-    if (cylonPos <= minX || cylonPos >= maxX) cylonDir *= -1;
-  }
-}
-
-//test set for troubleshooting
-void generateTestData() {
-  for (int i = 0; i < NUM_STOCKS; i++) {
-    for (int j = 0; j < SPARK_POINTS; j++) {
-      // Generate a float between 150.00 and 160.00
-      float randomCent = (float)random(0, 1000) / 100.0;
-      history[i][j] = 150.0 + randomCent;
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setCursor(xPos, yPos);
+    if (!isMarketOpen()) {
+      tft.print("SD: ");
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.print("CLOSED  ");
+      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    } else if (lastSDWriteTime == 0) {
+      tft.print("SD:---Wait---");
+    } else {
+      int minsAgo = (millis() - lastSDWriteTime) / 60000;
+      tft.printf("SD: %2dm ago", minsAgo);
     }
-    // Also set the current price to match the last point so the text matches the line
-    stockPrices[i] = history[i][SPARK_POINTS - 1];
-    stockChanges[i] = 1.50;  // Fake positive change
-    stockPercents[i] = 1.0;
-    // Fake 1% up
   }
-}
+
+  void drawTacticalHUD(int16_t rawX, int16_t rawY, bool hasTarget) {
+    const int hudX = 425;
+    const int hudY = 10;
+
+    if (hasTarget) {
+      tft.fillRect(hudX - 5, hudY - 2, 55, 30, TFT_BLACK);
+      tft.setTextSize(1);
+      tft.setTextColor(0x05E0, TFT_BLACK);
+
+      tft.setCursor(hudX, hudY);
+      tft.printf("X: %d", rawX);
+
+      tft.setCursor(hudX, hudY + 15);
+      tft.printf("Y: %d", rawY);
+    } else {
+      tft.fillRect(hudX - 5, hudY - 2, 55, 30, TFT_BLACK);
+    }
+  }
+
+  void drawCylonScanner() {
+    int yPos = 310, minX = 160, maxX = 320 - 25;
+    if (!wifiConnectedCached) {
+      tft.fillRect(minX, yPos, (maxX - minX) + 25, 10, TFT_BLACK);
+      tft.fillRect(cylonPos, yPos + 2, 25, 6, 0x8000);
+      tft.fillRect(cylonPos + 7, yPos + 1, 11, 8, TFT_RED);
+      cylonPos += cylonDir;
+      if (cylonPos <= minX || cylonPos >= maxX) cylonDir *= -1;
+    }
+  }
