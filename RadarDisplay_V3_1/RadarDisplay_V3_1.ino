@@ -59,6 +59,7 @@ int cylonPos = 160;
 int cylonDir = 4;
 bool timeIsSet = false;
 bool wasConnected = false;
+bool timeHealthy = false;
 bool owmHealthy = false;
 bool finnhubHealthy = false;
 
@@ -569,7 +570,11 @@ void fetchWorldWeather() {
 
   void updateClock() {
     struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) return;
+    if (!getLocalTime(&timeinfo)){
+      timeHealthy = false;
+      return;
+      }
+    timeHealthy = true;
     static int lastMin = -1;
     if (timeinfo.tm_min != lastMin) {
       lastMin = timeinfo.tm_min;
@@ -653,17 +658,17 @@ void drawSystemHealth() {
   tft.setCursor(5, yPos);
   tft.printf("WiFi: %.12s", WiFi.SSID().c_str());
   
-  // --- CONNECTION INDICATOR DOTS (Replacing RSSI) ---
+  // --- CONNECTION INDICATOR DOTS ---
   int dotX = 135; 
   int dotY = yPos + 3; // Vertically aligned with text
   int radius = 3;
   int spacing = 12;
 
-  uint16_t wifiColor = (WiFi.status() == WL_CONNECTED) ? TFT_GREEN : TFT_RED;
+  uint16_t timeColor = timeHealthy ? TFT_GREEN : TFT_RED;
   uint16_t owmColor = owmHealthy ? TFT_GREEN : TFT_RED;
   uint16_t finColor = finnhubHealthy ? TFT_GREEN : TFT_RED;
 
-  tft.fillCircle(dotX, dotY, radius, wifiColor);               // 1. WiFi
+  tft.fillCircle(dotX, dotY, radius, timeColor);               // 1. Time (NTP)
   tft.fillCircle(dotX + spacing, dotY, radius, owmColor);      // 2. OpenWeather
   tft.fillCircle(dotX + (spacing * 2), dotY, radius, finColor);// 3. Finnhub
   // --------------------------------------------------
